@@ -1,0 +1,120 @@
+{
+  "patternId": "PAT-INC-001",
+  "isArnPattern": true,
+  "serviceId": 101,
+  "components": [
+    {
+      "sequence": 1,
+      "type": "VARIABLE",
+      "token": "{PREFIX}",
+      "mandatory": true,
+      "transformation": "UPPERCASE"
+    },
+    {
+      "sequence": 2,
+      "type": "SEPARATOR",
+      "token": "-",
+      "value": "-",
+      "mandatory": true
+    },
+    {
+      "sequence": 3,
+      "type": "VARIABLE",
+      "token": "{SERVICE_CODE}",
+      "mandatory": true,
+      "transformation": "UPPERCASE"
+    },
+    {
+      "sequence": 4,
+      "type": "SEPARATOR",
+      "token": "-",
+      "value": "-",
+      "mandatory": true
+    },
+    {
+      "sequence": 5,
+      "type": "VARIABLE",
+      "token": "{SPGD_ENTITY}",
+      "mandatory": true,
+      "mappedAttribute": "s1$123$367"
+    },
+    {
+      "sequence": 6,
+      "type": "SEPARATOR",
+      "token": "-",
+      "value": "-",
+      "mandatory": true
+    },
+    {
+      "sequence": 7,
+      "type": "VARIABLE",
+      "token": "{FY}",
+      "mandatory": true
+    },
+    {
+      "sequence": 8,
+      "type": "SEPARATOR",
+      "token": "-",
+      "value": "-",
+      "mandatory": true
+    },
+    {
+      "sequence": 9,
+      "type": "VARIABLE",
+      "token": "{SEQ}",
+      "mandatory": true
+    },
+    {
+      "sequence": 10,
+      "type": "SEPARATOR",
+      "token": "-",
+      "value": "-",
+      "mandatory": true
+    },
+    {
+      "sequence": 11,
+      "type": "VARIABLE",
+      "token": "{SERVICE_ATTRIBUTE}",
+      "mandatory": true,
+      "mappedAttribute": "s1$123$dbc"
+    },
+    {
+      "sequence": 12,
+      "type": "VARIABLE",
+      "token": "{CHECKSUM}",
+      "mandatory": true
+    }
+  ],
+  "prefixConfig": {
+    "sourceMode": "STATIC",
+    "staticValue": "GOV"
+  },
+  "suffixConfig": {
+    "sourceMode": "STATIC",
+    "staticValue": "APP"
+  },
+  "sequenceConfig": {
+    "seriesType": "NUMERIC",
+    "digits": 6,
+    "minValue": 1,
+    "maxValue": 999999,
+    "startingValue": 1,
+    "increment": 1,
+    "padding": true,
+    "paddingChar": "0"
+  },
+  "resetConfig": {
+    "resetEnabled": true,
+    "resetAttributes": [
+      "{SERVICE_CODE}",
+      "{SERVICE_ATTRIBUTE}",
+      "FINANCIAL_YEAR"
+    ]
+  },
+  "checksumConfig": {
+    "enabled": true,
+    "algorithm": "LUHN"
+  },
+  "exhaustionPolicy": "THROW_ERROR",
+  "idempotencyEnabled": true
+}

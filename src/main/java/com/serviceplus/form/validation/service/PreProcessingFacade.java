@@ -1,0 +1,598 @@
+package com.serviceplus.form.validation.service;
+
+import static com.serviceplus.form.validation.utility.ApplicationConstants.APPLICATION_SUBMISSION_TASK_FLAG;
+import static com.serviceplus.form.validation.utility.ApplicationConstants.OFFICIAL_TASK_FLAG;
+import static com.serviceplus.form.validation.utility.SnowflakeIdGenerator.createUniqueId;
+import static com.serviceplus.form.validation.utility.Utility.decryptServiceKeys;
+import static com.serviceplus.form.validation.utility.Utility.encryptServiceKeys;
+import static com.serviceplus.form.validation.utility.Utility.encryptWorkflowKey;
+import static com.serviceplus.form.validation.utility.Utility.getClientIpAddr;
+import static com.serviceplus.form.validation.utility.Utility.isEmpty;
+import static java.util.Objects.isNull;
+
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.stream.Collectors;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.server.reactive.ServerHttpRequest;
+import org.springframework.stereotype.Service;
+import org.springframework.web.reactive.function.server.ServerResponse;
+
+import com.serviceplus.form.validation.ExceptionHandler.SPRuntimeError;
+import com.serviceplus.form.validation.dto.FormPreparationContext;
+import com.serviceplus.form.validation.dto.HandlerResponse;
+import com.serviceplus.form.validation.dto.InboxApplReqDTO;
+import com.serviceplus.form.validation.dto.OfficeDetailsDTO;
+import com.serviceplus.form.validation.dto.ServerSidePaginationRecord;
+import com.serviceplus.form.validation.dto.ServiceMeta;
+import com.serviceplus.form.validation.dto.ServiceProcessFlowDTO;
+import com.serviceplus.form.validation.dto.UserSessionObject;
+import com.serviceplus.form.validation.dto.WorkflowInboxResponse;
+import com.serviceplus.form.validation.entity.ApplicationDetails;
+import com.serviceplus.form.validation.entity.ApplicationFlowStatusEntity;
+import com.serviceplus.form.validation.entity.ProcessingTxn;
+import com.serviceplus.form.validation.entity.TempTransactionLogs;
+import com.serviceplus.form.validation.repository.ApplicationDetailsRepository;
+import com.serviceplus.form.validation.repository.CurrentProcessRepository;
+import com.serviceplus.form.validation.repository.ProcessingTxnRepository;
+
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+
+@Service
+public class PreProcessingFacade {
+
+    @Autowired
+    private ReactiveApiClient reactiveApiClient;
+
+    @Autowired
+    private ProcessingTxnRepository txnRepository;
+
+    @Autowired
+    private TempTransactionLogService tempTransactionLogService;
+
+    @Autowired
+    private CurrentProcessRepository currentProcessRepository;
+
+    @Autowired
+    private RedisService redis;
+
+    @Autowired
+    private TransactionalDBExecutor transactionalDBExecutor;
+
+    @Autowired
+    private ApplicationDetailsRepository applicationDetailsRepository;
+
+    @Autowired
+    private EditFormDetailsService editFormDetailsService;
+
+    @Autowired
+    private WorkflowWebServiceRetrySchedulerService workflowWebServiceRetrySchedulerService;
+
+    private static final Logger applicationFlowLogs = LogManager.getLogger("applicationFlowLogger");
+
+    public Mono<List<ServiceMeta>> getServiceList(UserSessionObject user) {
+
+        return reactiveApiClient.fetchServiceList(user)
+                .map(services -> {
+
+                    services.forEach(service ->
+                            service.setServiceKey(encryptServiceKeys(service)));
+
+                    return services;
+                });
+    }
+
+    public Mono<HandlerResponse> getFormDataAndSaveTempTxn(String appId, ServiceMeta service,
+                                                           UserSessionObject user,
+                                                           ServerHttpRequest request) {
+
+        return tempTransactionLogService
+                .mergeTransactionLog(service, user, request)
+                .flatMap(data -> {
+
+                    if (isNull(data)) {
+                        return Mono.empty();
+                    }
+
+                    return prepareForm(
+                            service, user, data.getTxnId(), appId
+                    ).flatMap(context ->
+
+                            reactiveApiClient.fetchFormData(
+                                            context.txnId(), context.service(),context.applicationId(), user
+                                    )
+                                    .flatMap(response -> {
+                                        ServiceProcessFlowDTO.Data.WorkflowElementData workflowElementData =
+                                                context.service().getWorkflowElementData();
+
+                                        response.setWorkflowElementData(workflowElementData);
+                                        response.setWorkflowKey(context.workflowKey());
+
+                                        String formIdToMatch = service.getFormId();
+                                        if (appId != null && !appId.isBlank()) {
+                                            return editFormDetailsService.getSavedEditPermission(appId, formIdToMatch)
+                                                    .defaultIfEmpty(Collections.emptyMap())
+                                                    .doOnNext(permissionMap -> {
+                                                        applyEditPermission(response, workflowElementData, permissionMap);
+                                                    })
+                                                    .thenReturn(response);
+                                        }
+
+                                        applyEditPermission(response, workflowElementData, Collections.emptyMap());
+                                        return Mono.just(response);
+                                    })
+                    );
+                });
+    }
+
+    private void applyEditPermission(HandlerResponse response,
+                                     ServiceProcessFlowDTO.Data.WorkflowElementData workflowElementData,
+                                     Map<String, Object> permissionMap) {
+        if (isPermissionNotBlank(permissionMap)) {
+            response.setEditPermission(permissionMap);
+            if (workflowElementData != null) {
+                workflowElementData.setFallBackEditPermission(permissionMap);
+            }
+            if (response.getData() != null) {
+                response.getData().put("editPermission", permissionMap);
+            }
+        } else {
+            response.setEditPermission(null);
+            if (workflowElementData != null) {
+                workflowElementData.setFallBackEditPermission(null);
+            }
+            if (response.getData() != null) {
+                response.getData().remove("editPermission");
+            }
+        }
+    }
+
+    private boolean isPermissionNotBlank(Map<String, Object> permissionMap) {
+        if (permissionMap == null || permissionMap.isEmpty()) {
+            return false;
+        }
+        Object allowedObj = permissionMap.get("allowed");
+        Object restrictedObj = permissionMap.get("restricted");
+        Object hideObj = permissionMap.get("hide");
+
+        boolean hasAllowed = (allowedObj instanceof java.util.Collection<?> c && !c.isEmpty());
+        boolean hasRestricted = (restrictedObj instanceof java.util.Collection<?> c && !c.isEmpty());
+        boolean hasHide = (hideObj instanceof java.util.Collection<?> c && !c.isEmpty());
+
+        return hasAllowed || hasRestricted || hasHide;
+    }
+
+    public Mono<ProcessingTxn> getFormDataAndSaveTxn(ServiceMeta service, UserSessionObject user, ServerHttpRequest request,
+                                                     TempTransactionLogs tempLog, String appId, String dataId, String activityType, boolean newEntityFlag,
+                                                     ApplicationFlowStatusEntity oldFlowStatus, String referenceNo,String actionTinyUrl) {
+        String txnId=tempLog.getTxnId();
+        LocalDateTime dt = LocalDateTime.ofInstant(Instant.now(), ZoneId.systemDefault());
+        LocalDateTime now = LocalDateTime.ofInstant(Instant.now(), ZoneId.systemDefault());
+        String applicationId = isEmpty(appId) ?  createUniqueId() : appId;
+
+        applicationFlowLogs.info(
+                "Saving transaction started for txnId : {} applicationId : {} dataId : {}",
+                txnId,
+                applicationId,
+                dataId);
+
+        applicationFlowLogs.info(
+                "Preparing ProcessingTxn entity for txnId : {}",
+                txnId);
+
+        ProcessingTxn txnEntity = new ProcessingTxn(
+            txnId,
+            service.getFormId(),
+            service.getServiceId(),
+            service.getTaskId(),
+            dt,
+            null,
+            user.getUserID(),
+            user.getTenantId(),
+            getClientIpAddr(request),
+                applicationId
+        );
+
+        if(tempLog.getStartTime() != null) {
+            applicationFlowLogs.info(
+                    "Updating start time for existing txnId : {}",
+                    txnId);
+            txnEntity.setStartTime(dt);
+        }
+
+        txnEntity.setNewEntity(newEntityFlag);
+
+        applicationFlowLogs.info(
+                "Preparing ApplicationDetails entity for applicationId : {}",
+                applicationId);
+
+        ApplicationDetails applicationDetails = new ApplicationDetails(
+                applicationId,
+                "DRAFT_".concat(txnId),
+                service.getServiceId(),
+                now,
+                user.getUserName(),
+                "S",
+                user.getUserID(),
+                user.getTenantId()
+        );
+
+        applicationDetails.setReferenceNo(referenceNo);
+        applicationDetails.setNewEntity(newEntityFlag);
+        //applicationDetails.setAppliedLocationId(service.getLocations().getFirst().getOrgUnitCode().intValue());
+        //applicationDetails.setAppliedLocationName(service.getLocations().getFirst().getOrgUnitName());
+        applicationDetails.setServiceName(service.getServiceName());
+        applicationDetails.setIsPriority(service.getIsPriority());
+        applicationDetails.setActionTinyUrl(actionTinyUrl);
+        applicationFlowLogs.info(
+                "Preparing ApplicationFlowStatusEntity for txnId : {}",
+                txnId);
+
+        ApplicationFlowStatusEntity flowStatusTemp = new ApplicationFlowStatusEntity();
+
+        if (isNull(oldFlowStatus) || isNull(oldFlowStatus.getId())) {
+
+            flowStatusTemp.setId(createUniqueId());
+            flowStatusTemp.setApplicationId(applicationId);
+            flowStatusTemp.setFormId(service.getFormId());
+            flowStatusTemp.setTxnId(txnId);
+            flowStatusTemp.setActivityType(activityType);
+            flowStatusTemp.setCompleted(0);
+            flowStatusTemp.setTenantId(user.getTenantId());
+            flowStatusTemp.setNewEntity(true);
+            flowStatusTemp.setTaskId(service.getTaskId());
+            flowStatusTemp.setServiceId(service.getServiceId());
+            flowStatusTemp.setLastUpdate(now);
+
+        } else {
+            flowStatusTemp = oldFlowStatus;
+        }
+
+        final ApplicationFlowStatusEntity flowStatus = flowStatusTemp;
+
+
+        applicationFlowLogs.info(
+                "Executing transactional DB operation for txnId : {} newEntityFlag : {}",
+                txnId,
+                newEntityFlag);
+
+        if(newEntityFlag) {
+
+            return transactionalDBExecutor
+                    .execute(
+                            txnId,
+                            applicationDetails,
+                            flowStatus,
+                            txnEntity)
+                    .doOnSuccess(success ->
+                            applicationFlowLogs.info(
+                                    "Transaction saved successfully for txnId : {}",
+                                    txnId))
+                    .then(redis.remove(txnId))
+                    .doOnSuccess(success ->
+                            applicationFlowLogs.info(
+                                    "Redis temporary transaction removed successfully for txnId : {}",
+                                    txnId))
+                    .thenReturn(txnEntity)
+                    .onErrorResume(Exception.class, ex -> {
+
+                        applicationFlowLogs.error(
+                                "Unable to process transaction for txnId : {} error : {}",
+                                txnId,
+                                ex.getMessage(),
+                                ex);
+
+                        return Mono.error(
+                                new SPRuntimeError(
+                                        "Unable to process your request [AY - 01]",
+                                        HttpStatus.INTERNAL_SERVER_ERROR,
+                                        txnId
+                                ));
+                    });
+        }
+        
+		applicationFlowLogs.info("newEntityFlag is false, will update ApplicationDetails priority before txn update for txnId : {} applicationId : {}",
+				txnId, applicationId);
+
+		return Flux.fromArray(applicationId.split(","))
+		        .map(String::trim)
+		        .filter(id -> !id.isBlank())
+		        .concatMap(applId -> {
+
+		            applicationFlowLogs.info(
+		                    "Processing applicationId : {} for txnId : {}",
+		                    applId, txnId);
+
+		            return applicationDetailsRepository.findByApplicationId(applId)
+		                    .flatMap(existingApplDetails -> {
+
+		                        applicationFlowLogs.info(
+		                                "Updating ApplicationDetails for applicationId : {} isPriority : {} -> {}",
+		                                applId,
+		                                existingApplDetails.getIsPriority(),
+		                                service.getIsPriority());
+
+		                        existingApplDetails.setIsPriority(
+		                                service.getIsPriority());
+
+		                        return applicationDetailsRepository.save(
+		                                existingApplDetails);
+		                    })
+		                    .doOnSuccess(saved ->
+		                            applicationFlowLogs.info(
+		                                    "ApplicationDetails priority updated successfully for applicationId : {}",
+		                                    applId))
+		                    .doOnError(ex ->
+		                            applicationFlowLogs.error(
+		                                    "Unable to update ApplicationDetails priority for applicationId : {} error : {}",
+		                                    applId,
+		                                    ex.getMessage(),
+		                                    ex))
+
+		                    .then(
+		                            transactionalDBExecutor.execute(
+		                                    txnId,
+		                                    txnEntity,
+		                                    flowStatus))
+		                    .doOnSuccess(success ->
+		                            applicationFlowLogs.info(
+		                                    "Transaction updated successfully for applicationId : {} txnId : {}",
+		                                    applId,
+		                                    txnId))
+
+		                    .then(redis.remove(txnId))
+		                    .doOnSuccess(success ->
+		                            applicationFlowLogs.info(
+		                                    "Redis temporary transaction removed successfully for applicationId : {} txnId : {}",
+		                                    applId,
+		                                    txnId))
+
+		                    .thenReturn(applId);
+		        })
+		        .collectList()
+		        .thenReturn(txnEntity)
+		        .onErrorResume(Exception.class, ex -> {
+
+		            applicationFlowLogs.error(
+		                    "Unable to update transaction for applicationIds : {} error : {}",
+		                    applicationId,
+		                    ex.getMessage(),
+		                    ex);
+
+		            return Mono.error(
+		                    new SPRuntimeError(
+		                            "Unable to process your request [AY - 02]",
+		                            HttpStatus.INTERNAL_SERVER_ERROR,
+		                            txnId));
+		        });
+
+
+//        Mono<ProcessingTxn> res = applicationDetailsRepository.save(applicationDetails)
+//                .then(currentProcessRepository.save(currentProcess))
+//                .then(txnRepository.save(txnEntity));
+
+
+
+//        return transactionalOperator.execute(status ->
+//                applicationDetailsRepository.save(applicationDetails)
+//                        .then(currentProcessRepository.save(currentProcess))
+//                        .then(txnRepository.save(txnEntity))
+//        ).single();
+
+    }
+
+    public Mono<ProcessingTxn> saveTransactionReactive(ProcessingTxn txnEntity) {
+        return txnRepository.save(txnEntity);
+    }
+
+
+    public ServiceMeta decryptApplyKey(String applyKey) {
+        return decryptServiceKeys(applyKey);
+    }
+
+  
+    
+    public Mono<ServerResponse> fetchServiceKey(Integer baseServiceId,UserSessionObject user,ServerHttpRequest request,String appId,String taskId,Integer serviceId) {
+
+        return reactiveApiClient
+                .fetchServiceKey(baseServiceId,user,appId,taskId,serviceId)
+                .flatMap(response -> {
+                    if (user != null
+                            && user.getGuestSessionId() != null && !user.getGuestSessionId().isBlank()) {
+
+                        response.setRegistrationRequired(false);
+                    }
+
+                    return ServerResponse.ok().bodyValue(response);
+                });
+    }
+
+    public Mono<ServerSidePaginationRecord<WorkflowInboxResponse>> getWFPInbox(ServerHttpRequest request, UserSessionObject user) {
+
+        return reactiveApiClient.fetchWFPInbox(request,user)
+                .map(inboxList ->
+                        enrichInbox(inboxList, OFFICIAL_TASK_FLAG)
+                );
+    }
+    
+    //--------------------------
+    public Mono<ServerSidePaginationRecord<WorkflowInboxResponse>> getSlaApplications(
+            ServerHttpRequest request, UserSessionObject user) {
+
+        return reactiveApiClient.fetchSlaApplications(request, user)
+                .map(inboxList -> {
+
+                    if (inboxList.getData() != null) {
+                        inboxList.getData().forEach(inbox -> {
+                            if (inbox.getServiceId() != null
+                                    && inbox.getBaseServiceId() == null) {
+                                inbox.setBaseServiceId(
+                                        inbox.getServiceId() / 10000
+                                );
+                            }
+                        });
+                    }
+
+                    return enrichInbox(inboxList, OFFICIAL_TASK_FLAG);
+                });
+    }
+    
+
+
+    public Mono<ServerSidePaginationRecord<WorkflowInboxResponse>> getWFPOutbox(ServerHttpRequest request, UserSessionObject user) {
+
+        return reactiveApiClient.fetchWFPOutbox(request, user)
+                .map(outboxList ->
+                        enrichInbox(outboxList, OFFICIAL_TASK_FLAG)
+                );
+    }
+
+    public Mono<ServerSidePaginationRecord<WorkflowInboxResponse>> getApplicantInbox(
+            String requestBody,
+            ServerHttpRequest request,
+            UserSessionObject user) {
+
+        return reactiveApiClient
+                .fetchApplicantInbox(requestBody, request, user)
+                .map(inboxList ->
+                        enrichInbox(inboxList, OFFICIAL_TASK_FLAG)
+                );
+    }
+
+    private ServerSidePaginationRecord<WorkflowInboxResponse> enrichInbox(ServerSidePaginationRecord<WorkflowInboxResponse> inboxList, String taskType) {
+
+        List<WorkflowInboxResponse> data = inboxList.getData();
+
+        if (data == null || data.isEmpty()) {
+            return inboxList;
+        }
+
+        data.forEach(inbox -> {
+
+            ServiceMeta service = getServiceMeta(inbox);
+            inbox.setTaskType(taskType);
+            inbox.setServiceKey(encryptServiceKeys(service));
+        });
+
+        return inboxList;
+    }
+
+	public Mono<ServerSidePaginationRecord<WorkflowInboxResponse>> getWFPInboxFilterApplications(
+			ServerHttpRequest request, UserSessionObject user, InboxApplReqDTO inboxApplReqDTO) {
+
+		return reactiveApiClient.getWFPInboxFilterApplications(request, user, inboxApplReqDTO)
+                .map(inboxList ->
+                        enrichInbox(inboxList, OFFICIAL_TASK_FLAG)
+                );
+	}
+
+    private static ServiceMeta getServiceMeta(WorkflowInboxResponse inbox) {
+        ServiceMeta service = new ServiceMeta();
+
+        service.setServiceId(inbox.getServiceId());
+        service.setServiceName(inbox.getServiceName());
+        service.setFormId(inbox.getFormId());
+        service.setTaskId(inbox.getTaskId());
+        service.setTaskType(OFFICIAL_TASK_FLAG);
+        service.setBaseServiceId(inbox.getBaseServiceId());
+        service.setCurrentProcessId(inbox.getCurrentProcessId());
+
+        ServiceMeta.AvailableApplyLocations location = new ServiceMeta.AvailableApplyLocations();
+        location.setOrgUnitCode(isNull(inbox.getLocationId()) ? null : inbox.getLocationId().longValue());
+        location.setLocationName("");
+
+        service.setLocations(List.of(location));
+        return service;
+    }
+
+	public Mono<ServerSidePaginationRecord<WorkflowInboxResponse>> getOutboxApplications(ServerHttpRequest request, UserSessionObject user) {
+
+        return reactiveApiClient.getOutboxApplications(request, user)
+                .map(outboxList ->
+                        enrichInbox(outboxList, OFFICIAL_TASK_FLAG)
+                );
+    }
+
+
+
+	public Mono<ServerSidePaginationRecord<WorkflowInboxResponse>> getInboxApplications(ServerHttpRequest request, UserSessionObject user) {
+
+        return reactiveApiClient.getInboxApplications(request,user)
+                .map(inboxList ->
+                        enrichInbox(inboxList, OFFICIAL_TASK_FLAG)
+                );
+    }
+
+    public Mono<FormPreparationContext> prepareForm(ServiceMeta service, UserSessionObject user, String txnId, String applicationId) {
+
+        return reactiveApiClient
+                .fetchServiceMetadata(
+                        user, service.getServiceId(), txnId
+                )
+                .flatMap(metadata -> {
+
+                    if (metadata.getProcessFlowMap() == null || metadata.getProcessFlowMap().getData() == null) {
+                        return Mono.error(new SPRuntimeError("Internal processing error [REN-03]", HttpStatus.INTERNAL_SERVER_ERROR, txnId));
+                    }
+
+                    Optional<ServiceProcessFlowDTO.Data> task =
+                            metadata.getProcessFlowMap()
+                                    .getData()
+                                    .stream()
+                                    .filter(p ->
+                                            p.getNode() != null
+                                                    && service.getTaskId()
+                                                    .equals(p.getNode().getId()))
+                                    .findFirst();
+
+                    if (task.isEmpty()) {
+                        return Mono.error(new SPRuntimeError("Internal processing error [REN-05]", HttpStatus.INTERNAL_SERVER_ERROR, txnId));
+                    }
+
+                    ServiceProcessFlowDTO.Data taskData = task.get();
+
+                    Optional.ofNullable(taskData.getWorkflowElementData()).ifPresent(service::setWorkflowElementData);
+
+                    String workflowKey = encryptWorkflowKey(txnId, service);
+
+                    List<OfficeDetailsDTO.OfficeUnitData> allowedOffices = taskData.getAllowedOffices();
+
+                    if(service.getTaskType().equals(APPLICATION_SUBMISSION_TASK_FLAG)) {
+
+                        List<ServiceMeta.AvailableApplyLocations> locations =
+                                allowedOffices == null
+                                        ? new ArrayList<>()
+                                        : allowedOffices.stream()
+                                        .map(office -> {
+
+                                            ServiceMeta.AvailableApplyLocations location = new ServiceMeta.AvailableApplyLocations();
+                                            location.setOrgUnitCode(office.getOrgUnitCode() != null ? office.getOrgUnitCode().longValue() : null);
+                                            location.setOrgUnitName(office.getOrgUnitName());
+                                            location.setHolderIds(new ArrayList<>());
+
+                                            return location;
+                                        })
+                                        .collect(Collectors.toList());
+
+                        service.setLocations(locations);
+                    }
+
+                    return Mono.just(new FormPreparationContext(service, txnId, applicationId,  workflowKey));
+                });
+    }
+}
+
+
+
+
